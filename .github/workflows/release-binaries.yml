@@ -9,22 +9,7 @@ on:
         default: true
   push:
     branches:
-      - nx2-experimental
-    # A binary only changes when build inputs change; docs-only pushes skip the build.
-    paths:
-      - "src/**"
-      # Test-only changes cannot change a binary: the build configures with BUILD_TESTING=OFF and
-      # LICHII_TESTS=OFF below, so a push that only touches src/tests has nothing to rebuild.
-      - "!src/tests/**"
-      - "CMakeLists.txt"
-      - "CMakeModules/**"
-      - "externals/**"
-      - "dist/**"
-      - "tools/**"
-      - ".patch/**"
-      - "cpmfile.json"
-      - "*.profdata"
-      - ".github/workflows/release-binaries.yml"
+      - nx2-own-fixes
 
 permissions:
   contents: read
@@ -35,40 +20,14 @@ permissions:
 env:
   PGO_LLVM_VERSION: "23"
 
-# A running build is never cancelled: it finishes and publishes. A push meanwhile queues one build;
-# a later push replaces it, so the newest commit builds as soon as the running one is done.
+# Keep a separate run for every pushed commit, without replacing pending builds.
 concurrency:
-  group: release-binaries-${{ github.ref }}
+  group: release-binaries-${{ github.ref }}-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
-  prepare-release:
-    name: Prepare release
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - name: Prepare release tag
-        if: github.event_name == 'push' || inputs.publish_release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tag="build-${GITHUB_RUN_NUMBER}"
-          if tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null); then
-            if [ "$tag_sha" != "$GITHUB_SHA" ]; then
-              echo "Release tag $tag points to $tag_sha instead of $GITHUB_SHA"
-              exit 1
-            fi
-          else
-            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f "ref=refs/tags/$tag" -f "sha=$GITHUB_SHA"
-          fi
-
   build:
     name: ${{ matrix.platform }} binary
-    needs: prepare-release
     runs-on: ${{ matrix.runner }}
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -612,9 +571,6 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-  # Publishes every binary as a GitHub pre-release once every platform built: on pushes to
-  # nx2-experimental, and on manual runs unless "Publish the binaries as a GitHub release" is
-  # unticked.
   release:
     name: Publish release
     needs: build
@@ -623,6 +579,23 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Prepare release tag after successful builds
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="build-${GITHUB_RUN_NUMBER}"
+          if tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null); then
+            if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+              echo "Release tag $tag points to $tag_sha instead of $GITHUB_SHA"
+              exit 1
+            fi
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/$tag" -f "sha=$GITHUB_SHA"
+          fi
+
       - name: Download binaries
         uses: actions/download-artifact@v7
         with:
