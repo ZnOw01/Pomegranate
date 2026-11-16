@@ -33,6 +33,7 @@ jobs:
   build:
     name: ${{ matrix.platform }} binary
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 3000M
@@ -629,6 +630,7 @@ jobs:
     needs: build
     if: github.event_name == 'push' || inputs.publish_release
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
@@ -686,7 +688,39 @@ jobs:
           done
           ls -la dist
 
-      - name: Create release
+      - name: Check the release asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          required = {
+              'lichii-linux-x86_64.AppImage',
+              'lichii-linux-x86_64.tar.gz',
+              'lichii-linux-x86_64-pgo.AppImage',
+              'lichii-linux-x86_64-pgo.tar.gz',
+              'lichii-linux-aarch64.AppImage',
+              'lichii-linux-aarch64.tar.gz',
+              'lichii-linux-aarch64-pgo.AppImage',
+              'lichii-linux-aarch64-pgo.tar.gz',
+              'lichii-windows-x86_64.zip',
+              'lichii-windows-x86_64-pgo.zip',
+              'lichii-macos-arm64.zip',
+              'lichii-macos-arm64.dmg',
+          }
+          files = [p for p in Path('dist').iterdir() if p.is_file()]
+          actual = {p.name for p in files}
+          if actual != required:
+              missing = sorted(required - actual)
+              extra = sorted(actual - required)
+              raise SystemExit(f'Release assets differ: missing {missing}, extra {extra}')
+          empty = sorted(p.name for p in files if p.stat().st_size == 0)
+          if empty:
+              raise SystemExit(f'Release assets are empty: {empty}')
+          PY
+
+      - name: Create the draft release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -755,12 +789,80 @@ jobs:
           ${pgo_note}
           EOF
 
-          gh release create "${tag}" dist/* \
-            --repo "${GITHUB_REPOSITORY}" \
-            --verify-tag \
-            --prerelease \
-            --title "Lichii ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
-            --notes-file notes.md
+          error_file=$(mktemp)
+          trap 'rm -f "$error_file"' EXIT
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>"$error_file"; then
+            :
+          elif grep -Fxq 'release not found' "$error_file"; then
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --verify-tag \
+              --prerelease \
+              --title "Lichii ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
+              --notes-file notes.md
+          else
+            cat "$error_file" >&2
+            exit 1
+          fi
+
+      - name: Reconcile and publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: build-${{ github.run_number }}
+          ASSET_DIR: dist
+        run: |
+          set -euo pipefail
+          title="Lichii ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})"
+          export TITLE="$title"
+          gh release edit "$TAG" --title "$TITLE" --notes-file notes.md --prerelease --repo "$GITHUB_REPOSITORY"
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          repo, tag, title = os.environ['GITHUB_REPOSITORY'], os.environ['TAG'], os.environ['TITLE']
+          assets = pathlib.Path(os.environ['ASSET_DIR'])
+          def read_release():
+              result = subprocess.run(
+                  ['gh', 'release', 'view', tag, '--repo', repo, '--json', 'assets,isDraft,isPrerelease,tagName,name'],
+                  check=True, capture_output=True, text=True,
+              )
+              return json.loads(result.stdout)
+          published = read_release()
+          have = {a['name']: a['size'] for a in published['assets']}
+          expected = {p.name: p.stat().st_size for p in assets.iterdir() if p.is_file()}
+          upload = [str(p) for p in assets.iterdir() if p.is_file() and have.get(p.name) != p.stat().st_size]
+          if upload:
+              subprocess.run(['gh', 'release', 'upload', tag, *upload, '--clobber', '--repo', repo], check=True)
+              published = read_release()
+              have = {a['name']: a['size'] for a in published['assets']}
+          if expected != have:
+              missing = sorted(set(expected) - set(have))
+              extra = sorted(set(have) - set(expected))
+              raise SystemExit(f'Release assets differ: missing {missing}, extra {extra}')
+          if any(size == 0 for size in have.values()):
+              raise SystemExit(f'Release has empty assets: {sorted(name for name, size in have.items() if size == 0)}')
+          if published['isDraft']:
+              subprocess.run(['gh', 'release', 'edit', tag, '--draft=false', '--repo', repo], check=True)
+              published = read_release()
+              have = {a['name']: a['size'] for a in published['assets']}
+          if published['isDraft']:
+              raise SystemExit('Release is still a draft')
+          if not published['isPrerelease']:
+              raise SystemExit('Release is not a prerelease')
+          if published['tagName'] != tag:
+              raise SystemExit(f'Release tag is {published["tagName"]}, expected {tag}')
+          if published['name'] != title:
+              raise SystemExit(f'Release title is {published["name"]!r}, expected {title!r}')
+          if expected != have:
+              missing = sorted(set(expected) - set(have))
+              extra = sorted(set(have) - set(expected))
+              raise SystemExit(f'Release assets differ after publishing: missing {missing}, extra {extra}')
+          PY
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha')" = "$GITHUB_SHA"
 
       # LICHII_BUILD_TAG is baked into every binary as build-<run number>, and the update checker
       # compares release tags against it. A release whose tag or title names another run would be
