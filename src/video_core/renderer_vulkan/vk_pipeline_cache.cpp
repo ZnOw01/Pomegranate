@@ -839,6 +839,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         StaticVertexRepackEnabled(device.GetMinVertexInputBindingStrideAlignment());
     VideoCommon::Nx2FastDraw::g_dynamic_vertex_input.store(
         dynamic_features.has_dynamic_vertex_input, std::memory_order_relaxed);
+    VideoCommon::Nx2FastDraw::g_dynamic_vertex_streams.store(
+        dynamic_features.has_dynamic_vertex_input && dynamic_features.has_extended_dynamic_state,
+        std::memory_order_relaxed);
 
     dynamic_features.has_provoking_vertex = device.IsExtProvokingVertexSupported();
     dynamic_features.has_provoking_vertex_first_mode =
@@ -1030,7 +1033,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         if (!mesh_vertex_inputs_seeded) {
             mesh_vertex_inputs_seeded = true;
             for (const auto& [key, pipeline] : graphics_cache) {
-                if (pipeline && pipeline->IsMeshPipeline()) {
+                if (CanSeedMeshVertexInput(pipeline.get())) {
                     mesh_vertex_inputs.Add(key);
                 }
             }
@@ -3608,6 +3611,12 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     }
 
     auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+    // Compute has eight constant buffers. The Ampere lowering reads NVN2's root tables (banks
+    // 24-31) from bank 17, which only the 3D engine provides.
+    if (program.info.constant_buffer_mask >> Tegra::Engines::KeplerCompute::NumConstBuffers) {
+        throw Shader::RuntimeError("Compute program reads constant buffer mask {:#x}",
+                                   program.info.constant_buffer_mask);
+    }
     const VkDriverIdKHR driver_id = device.GetDriverID();
     const bool needs_shared_mem_clamp =
         driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
