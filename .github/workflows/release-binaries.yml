@@ -275,6 +275,8 @@ jobs:
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }}
             -DUSE_DISCORD_PRESENCE=OFF
             -DUSE_CCACHE=ON
+            # build-check keeps warnings fatal. A release must not stop on one.
+            -DENABLE_WERROR=OFF
           )
           if [ '${{ matrix.pgo }}' = 'true' ]; then
             # Same flags Eden's CI passes for its clang PGO build.
@@ -355,7 +357,8 @@ jobs:
             -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
             -DUSE_DISCORD_PRESENCE=OFF \
-            -DUSE_CCACHE=ON
+            -DUSE_CCACHE=ON \
+            -DENABLE_WERROR=OFF
 
       - name: Save CPM downloads
         if: steps.cpm-cache.outputs.cache-hit != 'true'
@@ -788,6 +791,11 @@ jobs:
 
           ${pgo_note}
           EOF
+          {
+            printf '\n## SHA-256\n\n```\n'
+            (cd dist && sha256sum -- *)
+            printf '```\n'
+          } >> notes.md
 
           error_file=$(mktemp)
           trap 'rm -f "$error_file"' EXIT
@@ -880,3 +888,7 @@ jobs:
             echo "Release is tagged '$published_tag' and titled '$published_title', expected tag $expected and a title naming build ${GITHUB_RUN_NUMBER}"
             exit 1
           fi
+          {
+            echo "Published [$expected]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$expected) from \`$GITHUB_SHA\`."
+            gh release view "$expected" --repo "$GITHUB_REPOSITORY" --json body --jq '.body'
+          } >> "$GITHUB_STEP_SUMMARY"
